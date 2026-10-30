@@ -3,6 +3,20 @@
 Конвертер модулей для BibleQuote 7.x: превращает любые текстовые книги в нативные
 модули и чинит библиотеку после «исчезновения» модулей.
 
+## Скачивание
+
+Готовый exe (Windows, не требует установки Python) — в разделе
+[**Releases**](https://github.com/luna0022/BibleQuote-ModuleConverter/releases):
+файл `BQModuleConverter.exe`. Рядом лежат `SHA256SUMS.txt` (контрольные суммы)
+и `SHA256SUMS.txt.asc` (GPG-подпись), `RELEASE_KEY.asc` — публичный ключ
+подписи. Проверка целостности после скачивания:
+
+```sh
+gpg --import RELEASE_KEY.asc
+gpg --verify SHA256SUMS.txt.asc SHA256SUMS.txt
+sha256sum -c SHA256SUMS.txt
+```
+
 ## Возможности
 
 - **Почти любые форматы текста → модуль**: TXT, Markdown, HTML, **PDF**, **DOCX** (Word),
