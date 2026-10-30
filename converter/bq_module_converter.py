@@ -18,6 +18,7 @@ import shutil
 import sys
 import unicodedata
 from dataclasses import dataclass, field
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -570,6 +571,12 @@ STANDALONE_ROMAN = re.compile(r"^\s*([IVXLCDM]{1,7})\s*\.?\s*$")
 STANDALONE_NUMBER = re.compile(r"^\s*(\d{1,3})\s*\.?\s*$")
 END_PUNCTUATION = tuple(".!?:;,")
 
+# Встроенное HTML-форматирование, которое понимает BibleQuote (и которое
+# сохраняется при вставке из Word/браузера и при чтении DOCX/PDF).
+INLINE_TAG_RE = re.compile(
+    r"</?(?:b|i|u|em|strong|sup|sub|font|span|br|p|div|h[1-6])\b", re.IGNORECASE
+)
+
 ROMAN_VALUES = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
 
 
@@ -709,12 +716,12 @@ def parse_generic_text(
             if in_html:
                 book.chapters.append("\n".join(current_chapter))
             else:
-                # Строки-разметка (<h2>..., <p><b>...), вставленные самим парсером,
-                # не экранируем: иначе BibleQuote не найдёт метки ChapterSign/VerseSign
-                # в теле книги и глава не откроется.
+                # Строки-разметка (<h2>..., <p><b>... или вставленный HTML с
+                # <b>/<i>/<u>) не экранируем: иначе BibleQuote не найдёт метки
+                # ChapterSign/VerseSign, а форматирование потеряется.
                 parts = []
                 for item in current_chapter:
-                    if item.lstrip().startswith("<"):
+                    if item.lstrip().startswith("<") or INLINE_TAG_RE.search(item):
                         parts.append(item)
                     elif item.strip():
                         parts.append(
@@ -733,6 +740,7 @@ def parse_generic_text(
 
     def start_titled_chapter(title: str, line_index: int) -> None:
         flush_chapter()
+        title = normalize_spaces(strip_html_markup(title))
         current_title.append(title)
         current_chapter.append(f"<h2>{html.escape(title, quote=False)}</h2>")
         report.headings.append(f"строка {line_index + 1}: {title} (заголовок)")
@@ -740,18 +748,21 @@ def parse_generic_text(
     for line_index, raw_line in enumerate(lines):
         line = raw_line.rstrip()
         stripped = line.strip()
-        if not stripped:
+        # все проверки ведём по тексту без HTML-разметки, чтобы теги
+        # форматирования не мешали определению глав и стихов
+        plain = strip_html_markup(stripped) if INLINE_TAG_RE.search(stripped) else stripped
+        if not plain:
             if current_chapter and current_chapter[-1] != "":
                 current_chapter.append("")
             continue
-        heading = CHAPTER_HEADING.match(stripped)
+        heading = CHAPTER_HEADING.match(plain)
         if heading:
             token = heading.group(1)
             value = int(token) if token.isdigit() else (roman_to_int(token.upper()) or 0)
             start_numbered_chapter(value or expected_number, token, line_index)
             continue
-        if stripped.startswith("#"):
-            start_titled_chapter(normalize_spaces(stripped.lstrip("# ")), line_index)
+        if plain.startswith("#"):
+            start_titled_chapter(normalize_spaces(plain.lstrip("# ")), line_index)
             continue
 
         # --- эвристики скоринга (одинокие цифры, жирные строки) ---
@@ -759,14 +770,14 @@ def parse_generic_text(
             standalone_value: Optional[int] = None
             label = ""
             if mode in {"auto", "roman"}:
-                match = STANDALONE_ROMAN.match(stripped)
+                match = STANDALONE_ROMAN.match(plain)
                 if match:
                     value = roman_to_int(match.group(1))
                     if value is not None and value == expected_number:
                         standalone_value = value
                         label = f"римская цифра {match.group(1)}"
             if standalone_value is None and mode in {"auto", "numbers"}:
-                match = STANDALONE_NUMBER.match(stripped)
+                match = STANDALONE_NUMBER.match(plain)
                 if match:
                     value = int(match.group(1))
                     # одинокое число на краю страницы — скорее номер страницы
@@ -777,15 +788,21 @@ def parse_generic_text(
             if standalone_value is None and mode in {"auto", "bold"} and marked:
                 # жирная/крупная строка: короткая, без финальной пунктуации,
                 # отделена пустой строкой (или начало текста)
-                short = len(stripped) <= 60
-                clean_end = not stripped.endswith(END_PUNCTUATION)
+                short = len(plain) <= 60
+                clean_end = not plain.endswith(END_PUNCTUATION)
                 surrounded = line_index == 0 or not lines[line_index - 1].strip()
                 if short and clean_end and surrounded:
-                    start_titled_chapter(normalize_spaces(stripped), line_index)
+                    start_titled_chapter(plain, line_index)
                     continue
             if standalone_value is not None:
                 start_numbered_chapter(standalone_value, label, line_index)
                 continue
+
+        # строка со встроенным HTML-форматированием (вставка из Word/браузера)
+        # проходит в модуль как есть — BibleQuote отрисует <b>, <i>, <u>
+        if not in_html and INLINE_TAG_RE.search(stripped):
+            current_chapter.append(line)
+            continue
 
         if in_html:
             current_chapter.append(line)
@@ -837,10 +854,6 @@ def looks_like_pdf_spoof(text: str) -> bool:
     return spoofed > len(letters) * 0.3 and cyrillic < len(letters) * 0.1
 
 
-def extract_pdf_text(path: Path, report: Report) -> str:
-    """Извлечь текст из PDF через pypdf (доступен в поставке Python)."""
-
-
 def extract_pdf_text(path: Path, report: Report) -> tuple[str, set[int], set[int]]:
     """Извлечь текст из PDF через pypdf (доступен в поставке Python).
 
@@ -848,7 +861,7 @@ def extract_pdf_text(path: Path, report: Report) -> tuple[str, set[int], set[int
     - края страниц — номера первых/последних непустых строк каждой страницы
       (там одинокие числа — обычно номера страниц, не главы);
     - крупный шрифт — номера строк, набранных заметно крупнее основного текста
-      (кандидаты в заголовки)."""
+      (кандидаты в заголовки). Жирный и курсив сохраняются тегами <b>/<i>."""
     try:
         from pypdf import PdfReader
     except ImportError as exc:  # pragma: no cover
@@ -861,17 +874,46 @@ def extract_pdf_text(path: Path, report: Report) -> tuple[str, set[int], set[int
     page_edge_lines: set[int] = set()
     big_fragments: list[str] = []
     for page in reader.pages:
-        fragments: list[tuple[str, float]] = []
+        fragments: list[tuple[str, float, bool, bool]] = []
 
         def visitor(text_fragment, _cm, _tm, font_dict, font_size) -> None:
             if text_fragment and text_fragment.strip():
-                fragments.append((text_fragment, float(font_size or 0)))
+                base_font = str((font_dict or {}).get("/BaseFont", ""))
+                fragments.append(
+                    (
+                        text_fragment,
+                        float(font_size or 0),
+                        "bold" in base_font.lower(),
+                        "italic" in base_font.lower() or "oblique" in base_font.lower(),
+                    )
+                )
 
         try:
-            page_text = page.extract_text(visitor_text=visitor) or ""
+            clean_text = page.extract_text() or ""
+            page.extract_text(visitor_text=visitor)
         except Exception as exc:
             report.warning(f"{path.name}: страница не прочитана: {exc}")
             continue
+        # накладываем жирный/курсив на чистый текст по совпадению фрагментов
+        # (самостоятельная сборка строк из фрагментов теряет переносы)
+        styled_parts: list[str] = []
+        position = 0
+        for frag, _size, bold, italic in fragments:
+            index = clean_text.find(frag, position)
+            if index < 0:
+                index = clean_text.find(frag)
+            if index < 0:
+                continue
+            styled_parts.append(clean_text[position:index])
+            chunk = frag
+            if italic:
+                chunk = f"<i>{chunk}</i>"
+            if bold:
+                chunk = f"<b>{chunk}</b>"
+            styled_parts.append(chunk)
+            position = index + len(frag)
+        styled_parts.append(clean_text[position:])
+        page_text = "".join(styled_parts)
         pages.append(page_text)
         page_lines = [ln for ln in page_text.splitlines() if ln.strip()]
         if page_lines:
@@ -880,10 +922,10 @@ def extract_pdf_text(path: Path, report: Report) -> tuple[str, set[int], set[int
             page_edge_lines.add(len(all_lines) - 1)  # последняя строка страницы
         else:
             all_lines.extend(page_text.splitlines())
-        sizes = sorted(size for _frag, size in fragments)
+        sizes = sorted(size for _frag, size, _b, _i in fragments)
         if len(sizes) >= 4 and sizes[-1] > sizes[len(sizes) // 2] * 1.15:
             median = sizes[len(sizes) // 2]
-            for frag, size in fragments:
+            for frag, size, _b, _i in fragments:
                 if size > median * 1.15 and len(frag.strip()) >= 4:
                     big_fragments.append(normalize_spaces(frag.strip()))
     text = "\n\n".join(pages).strip()
@@ -902,9 +944,9 @@ def extract_pdf_text(path: Path, report: Report) -> tuple[str, set[int], set[int
     # переводим крупные фрагменты в номера строк итогового текста
     big_lines: set[int] = set()
     if big_fragments:
-        wanted = {normalize_spaces(frag) for frag in big_fragments}
+        wanted = {normalize_spaces(strip_html_markup(frag)) for frag in big_fragments}
         for index, ln in enumerate(text.splitlines()):
-            norm = normalize_spaces(ln.strip())
+            norm = normalize_spaces(strip_html_markup(ln.strip()))
             if norm and norm in wanted:
                 big_lines.add(index)
     return text, page_edge_lines, big_lines
@@ -923,8 +965,23 @@ def extract_docx_text(path: Path) -> tuple[str, set[int]]:
     document = docx.Document(str(path))
     lines: list[str] = []
     bold_lines: set[int] = set()
+
+    def styled_run(run) -> str:
+        """Текст пробега с сохранением форматирования, понятного BibleQuote."""
+        chunk = run.text
+        if not chunk:
+            return ""
+        if run.underline:
+            chunk = f"<u>{chunk}</u>"
+        if run.italic:
+            chunk = f"<i>{chunk}</i>"
+        if run.bold:
+            chunk = f"<b>{chunk}</b>"
+        return chunk
+
     for paragraph in document.paragraphs:
-        text = normalize_spaces(strip_html_markup(paragraph.text))
+        raw = "".join(styled_run(run) for run in paragraph.runs) or paragraph.text
+        text = normalize_spaces(strip_html_markup(raw))
         if not text:
             lines.append("")
             continue
@@ -935,9 +992,9 @@ def extract_docx_text(path: Path) -> tuple[str, set[int]]:
         if style_name.startswith("heading") or style_name.startswith("заголовок"):
             level_match = re.search(r"(\d+)", style_name)
             level = int(level_match.group(1)) if level_match else 1
-            lines.append("#" * min(level, 6) + " " + text)
+            lines.append("#" * min(level, 6) + " " + raw)
         else:
-            lines.append(text)
+            lines.append(raw)
     return "\n".join(lines), bold_lines
 
 
@@ -1423,8 +1480,8 @@ def run_gui() -> int:
 
     root = tk.Tk()
     root.title("Конвертер модулей BibleQuote")
-    root.geometry("860x780")
-    root.minsize(720, 640)
+    root.geometry("900x960")
+    root.minsize(760, 860)
 
     input_var = tk.StringVar()
     output_var = tk.StringVar()
@@ -1439,6 +1496,7 @@ def run_gui() -> int:
     main = ttk.Frame(root, padding=12)
     main.pack(fill=tk.BOTH, expand=True)
     main.columnconfigure(1, weight=1)
+    main.rowconfigure(8, weight=2)
     main.rowconfigure(9, weight=1)
 
     def choose_input() -> None:
@@ -1485,7 +1543,7 @@ def run_gui() -> int:
 
     def do_convert() -> None:
         log.delete("1.0", tk.END)
-        pasted = paste_text.get("1.0", tk.END).strip()
+        pasted = paste_to_markup().strip()
         temp_input: Optional[Path] = None
         if pasted and not input_var.get().strip():
             # Вставленный текст складываем во временный файл и конвертируем как text.
@@ -1608,13 +1666,188 @@ def run_gui() -> int:
     ttk.Entry(main, textvariable=pattern_var).grid(row=7, column=1, sticky=tk.EW, pady=3)
     ttk.Button(main, text="?", width=3, command=show_pattern_help).grid(row=7, column=2, padx=(8, 0), pady=3)
 
-    paste_frame = ttk.Labelframe(main, text=" Или вставьте текст сюда (работает, если поле «Источник» пустое) ")
-    paste_frame.grid(row=8, column=0, columnspan=3, sticky=tk.EW, pady=(8, 4))
+    paste_frame = ttk.Labelframe(
+        main,
+        text=" Или вставьте текст сюда (работает, если поле «Источник» пустое; "
+        "вставка из Word/браузера сохраняет жирный, курсив, подчёркивание) ",
+    )
+    paste_frame.grid(row=8, column=0, columnspan=3, sticky=tk.NSEW, pady=(8, 4))
     paste_frame.columnconfigure(0, weight=1)
-    paste_text = scrolledtext.ScrolledText(paste_frame, height=7, wrap=tk.WORD)
-    paste_text.grid(row=0, column=0, sticky=tk.EW)
+    paste_frame.rowconfigure(0, weight=1)
+    paste_text = scrolledtext.ScrolledText(paste_frame, height=16, wrap=tk.WORD)
+    paste_text.grid(row=0, column=0, sticky=tk.NSEW)
 
-    log = scrolledtext.ScrolledText(main, height=12, wrap=tk.WORD)
+    # WYSIWYG-форматирование в поле вставки: теги fmt_<b><i><u> (цифры 0/1).
+    import tkinter.font as tkfont
+
+    _base_font = tkfont.nametofont("TkTextFont")
+    _font_cache = {}
+
+    def _fmt_font(bold: bool, italic: bool, underline: bool):
+        key = (bold, italic, underline)
+        if key not in _font_cache:
+            f = tkfont.Font(family=_base_font.cget("family"), size=_base_font.cget("size"))
+            if bold:
+                f.configure(weight="bold")
+            if italic:
+                f.configure(slant="italic")
+            if underline:
+                f.configure(underline=True)
+            _font_cache[key] = f
+        return _font_cache[key]
+
+    for _b in (0, 1):
+        for _i in (0, 1):
+            for _u in (0, 1):
+                paste_text.tag_configure(
+                    f"fmt_{_b}{_i}{_u}", font=_fmt_font(bool(_b), bool(_i), bool(_u))
+                )
+
+    class _RichRenderer(HTMLParser):
+        """Отрисовывает HTML-фрагмент из буфера обмена в Text с тегами fmt_*."""
+
+        _BLOCK = {"p", "div", "li", "tr", "table", "ul", "ol", "blockquote"}
+
+        def __init__(self, widget):
+            super().__init__(convert_charrefs=True)
+            self.w = widget
+            self.bold = 0
+            self.italic = 0
+            self.underline = 0
+            self.heading = 0
+
+        def _newline(self) -> None:
+            if self.w.index("end-1c") != "1.0" and not self.w.get("end-2c", "end-1c").endswith("\n"):
+                self.w.insert(tk.INSERT, "\n", "fmt_000")
+
+        def _insert(self, data: str) -> None:
+            if not data:
+                return
+            b = 1 if (self.bold or self.heading) else 0
+            i = 1 if self.italic else 0
+            u = 1 if self.underline else 0
+            self.w.insert(tk.INSERT, data, f"fmt_{b}{i}{u}")
+
+        def handle_starttag(self, tag, attrs):
+            tag = tag.lower()
+            if tag in ("b", "strong"):
+                self.bold += 1
+            elif tag in ("i", "em"):
+                self.italic += 1
+            elif tag == "u":
+                self.underline += 1
+            elif tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
+                self._newline()
+                if tag in ("h1", "h2", "h3"):
+                    self.heading += 1
+            elif tag in self._BLOCK:
+                self._newline()
+            elif tag == "br":
+                self._newline()
+
+        def handle_endtag(self, tag):
+            tag = tag.lower()
+            if tag in ("b", "strong") and self.bold:
+                self.bold -= 1
+            elif tag in ("i", "em") and self.italic:
+                self.italic -= 1
+            elif tag == "u" and self.underline:
+                self.underline -= 1
+            elif tag in ("h1", "h2", "h3") and self.heading:
+                self.heading -= 1
+                self._newline()
+            elif tag in ("p", "div", "li", "tr"):
+                self._newline()
+
+        def handle_data(self, data):
+            self._insert(data)
+
+    def paste_to_markup() -> str:
+        """Сериализует поле вставки обратно в текст с тегами <b>/<i>/<u>,
+        чтобы учитывались и ручные правки после вставки."""
+        import html as _html
+
+        out = []
+        active = set()
+        for item in paste_text.dump("1.0", "end-1c", tag=True, text=True):
+            kind = item[0]
+            if kind == "tagon":
+                if item[1].startswith("fmt_"):
+                    active.add(item[1])
+            elif kind == "tagoff":
+                active.discard(item[1])
+            elif kind == "text" and item[1]:
+                b = any(t[4] == "1" for t in active)
+                i = any(t[5] == "1" for t in active)
+                u = any(t[6] == "1" for t in active)
+                chunk = _html.escape(item[1])
+                if u:
+                    chunk = f"<u>{chunk}</u>"
+                if i:
+                    chunk = f"<i>{chunk}</i>"
+                if b:
+                    chunk = f"<b>{chunk}</b>"
+                out.append(chunk)
+        return "".join(out)
+
+    def clipboard_html() -> str:
+        """HTML из буфера обмена Windows (CF_HTML), если его туда положили
+        Word/браузер. CF_HTML хранится байтами (обычно UTF-8)."""
+        try:
+            import ctypes
+
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+            kernel32.GlobalLock.restype = ctypes.c_void_p
+            user32.GetClipboardData.restype = ctypes.c_void_p
+            cf_html = user32.RegisterClipboardFormatW("HTML Format")
+            if not user32.OpenClipboard(0):
+                return ""
+            try:
+                handle = user32.GetClipboardData(cf_html)
+                if not handle:
+                    return ""
+                pointer = kernel32.GlobalLock(handle)
+                if not pointer:
+                    return ""
+                try:
+                    raw_bytes = ctypes.string_at(pointer)
+                finally:
+                    kernel32.GlobalUnlock(handle)
+            finally:
+                user32.CloseClipboard()
+            raw = ""
+            for enc in ("utf-8", "cp1251", "latin-1"):
+                try:
+                    raw = raw_bytes.decode(enc)
+                    break
+                except UnicodeDecodeError:
+                    continue
+            match = re.search(
+                r"<!--StartFragment-->(.*?)<!--EndFragment-->", raw, re.S | re.I
+            )
+            return match.group(1) if match else ""
+        except Exception:
+            return ""
+
+    def paste_rich(_event=None):
+        """Ctrl+V: вставляем HTML из буфера с сохранением форматирования
+        (жирный/курсив/подчёркивание отображаются прямо в поле); иначе — текст."""
+        fragment = clipboard_html()
+        if fragment:
+            _RichRenderer(paste_text).feed(fragment)
+        else:
+            try:
+                plain = paste_text.clipboard_get()
+            except Exception:
+                return "break"
+            paste_text.insert(tk.INSERT, plain, "fmt_000")
+        return "break"
+
+    paste_text.bind("<Control-v>", paste_rich)
+    paste_text.bind("<Control-V>", paste_rich)
+
+    log = scrolledtext.ScrolledText(main, height=7, wrap=tk.WORD)
     log.grid(row=9, column=0, columnspan=3, sticky=tk.NSEW, pady=(12, 8))
 
     buttons = ttk.Frame(main)
