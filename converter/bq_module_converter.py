@@ -704,6 +704,28 @@ def parse_generic_text(path: Path, text: str, options: Options, report: Report) 
     return [book]
 
 
+# Подмена кириллицы в некоторых старых PDF: текст хранится как похожие
+# латинские/IPA-глифы (файл визуально русский, а извлекается «ɚɩɨɤɪɢɮ»).
+# Два варианта глифа на одну букву — документ собран из разных шрифтов.
+PDF_SPOOF_MAP = str.maketrans(
+    "ȺȻȼȽȾȿɀɁɂɄɅɆɇɈɉɊɋɌɍɎɏɘ"
+    "ɐɑɒɗəɚɛɜɝɞɟɠɡɢɣɤɥɦɧɨɩɪɫɬɭɮɯɰɱɲɳɴɵɶɷɸɹ",
+    "АБВГДЕЖЗИКЛМНОПРСТУФХЮ"
+    "цчшэяабвгдежзийклмнопрстуфхцчшщъыьэюя",
+)
+
+
+def looks_like_pdf_spoof(text: str) -> bool:
+    """True, если текст похож на подменённую кириллицу (много IPA-глифов,
+    настоящей кириллицы почти нет)."""
+    letters = [ch for ch in text if ch.isalpha()]
+    if len(letters) < 100:
+        return False
+    spoofed = sum(1 for ch in letters if "Ⱥ" <= ch <= "ɹ")
+    cyrillic = sum(1 for ch in letters if "Ѐ" <= ch <= "ӿ")
+    return spoofed > len(letters) * 0.3 and cyrillic < len(letters) * 0.1
+
+
 def extract_pdf_text(path: Path, report: Report) -> str:
     """Извлечь текст из PDF через pypdf (доступен в поставке Python)."""
     try:
@@ -724,6 +746,13 @@ def extract_pdf_text(path: Path, report: Report) -> str:
         raise ConversionError(
             f"{path.name}: в PDF не извлечён текст — возможно, это скан без текстового слоя."
         )
+    if looks_like_pdf_spoof(text):
+        fixed = text.translate(PDF_SPOOF_MAP)
+        report.warning(
+            f"{path.name}: текст PDF был закодирован латинскими «двойниками» кириллицы; "
+            f"восстановлена русская кодировка."
+        )
+        text = fixed
     return text
 
 
@@ -828,6 +857,14 @@ def convert_plain(options: Options, report: Report) -> tuple[list[Book], list[tu
     return books, settings
 
 
+# Дореволюционная кириллица (ѣ, і, ѳ, ѵ и т.п.) не влезает в Windows-1251.
+# При необходимости приводим её к современным буквам — это лучше, чем «?».
+OLD_CYRILLIC_MAP = str.maketrans(
+    "ѢѣІіѲѳѴѵѶѷѠѡѾѿꙊꙋѮѯѰѱѪѫѬѭѨѩꙖꙗѤѥ",
+    "ЕеИиФфИиИиОоОоУуКсПсАаЯяЯяЕеЕе",
+)
+
+
 def encode_windows_lines(text: str, report: Optional[Report] = None, source_name: str = "") -> bytes:
     """Write exact CRLF in the legacy Windows-1251 module format."""
     normalized = text.replace("\r\n", "\n").replace("\r", "\n")
@@ -835,6 +872,16 @@ def encode_windows_lines(text: str, report: Optional[Report] = None, source_name
     try:
         return normalized.encode("cp1251")
     except UnicodeEncodeError:
+        modernized = normalized.translate(OLD_CYRILLIC_MAP)
+        if modernized != normalized:
+            if report is not None:
+                report.warning(
+                    f"{source_name}: дореволюционные буквы (ѣ, і, ѳ, ѵ) приведены к современным."
+                )
+            try:
+                return modernized.encode("cp1251")
+            except UnicodeEncodeError:
+                normalized = modernized
         if report is not None:
             report.warning(
                 f"{source_name} содержит символы вне Windows-1251; они заменены на «?»."
