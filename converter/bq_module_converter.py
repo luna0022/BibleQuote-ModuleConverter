@@ -1668,8 +1668,9 @@ def run_gui() -> int:
 
     paste_frame = ttk.Labelframe(
         main,
-        text=" Или вставьте текст сюда (работает, если поле «Источник» пустое; "
-        "вставка из Word/браузера сохраняет жирный, курсив, подчёркивание) ",
+        text=" Поле ввода с форматированием (работает, если поле «Источник» пустое): "
+        "вставляйте из Word/PDF/браузера — жирный, курсив, подчёркивание сохраняются, "
+        "выделенный текст можно форматировать кнопками или Ctrl+B/I/U ",
     )
     paste_frame.grid(row=8, column=0, columnspan=3, sticky=tk.NSEW, pady=(8, 4))
     paste_frame.columnconfigure(0, weight=1)
@@ -1761,6 +1762,84 @@ def run_gui() -> int:
 
         def handle_data(self, data):
             self._insert(data)
+
+    def _selection_segments(start: str, end: str):
+        """Разбивает диапазон на куски (текст, fmt_тег) по текущим тегам."""
+        segs = []
+        active = "fmt_000"
+        for item in paste_text.dump(start, end, tag=True, text=True):
+            if item[0] == "tagon" and item[1].startswith("fmt_"):
+                active = item[1]
+            elif item[0] == "tagoff" and item[1].startswith("fmt_"):
+                active = "fmt_000"
+            elif item[0] == "text" and item[1]:
+                if segs and segs[-1][1] == active:
+                    segs[-1][0] += item[1]
+                else:
+                    segs.append([item[1], active])
+        return segs
+
+    def _apply_attr(attr: int, force=None):
+        """Включает/выключает атрибут (0=жирный, 1=курсив, 2=подчёркивание)
+        на выделенном тексте. force=True включить, False выключить."""
+        try:
+            start = paste_text.index(tk.SEL_FIRST)
+            end = paste_text.index(tk.SEL_LAST)
+        except tk.TclError:
+            return "break"
+        if paste_text.compare(start, "==", end):
+            return "break"
+        segs = _selection_segments(start, end)
+        if force is None:
+            # Если уже весь выделенный текст с атрибутом — выключаем, иначе включаем.
+            force = not all(seg[1][4 + attr] == "1" for seg in segs)
+        paste_text.delete(start, end)
+        pos = start
+        for text, tag in segs:
+            digits = list(tag[4:7])
+            digits[attr] = "1" if force else "0"
+            paste_text.insert(pos, text, "fmt_" + "".join(digits))
+            pos = paste_text.index(f"{pos} + {len(text)}c")
+        paste_text.tag_add(tk.SEL, start, pos)
+        paste_text.mark_set(tk.INSERT, pos)
+        paste_text.see(pos)
+        return "break"
+
+    def _clear_format_impl(_event=None):
+        try:
+            start = paste_text.index(tk.SEL_FIRST)
+            end = paste_text.index(tk.SEL_LAST)
+        except tk.TclError:
+            return "break"
+        if paste_text.compare(start, "==", end):
+            return "break"
+        segs = _selection_segments(start, end)
+        paste_text.delete(start, end)
+        pos = start
+        for text, _tag in segs:
+            paste_text.insert(pos, text, "fmt_000")
+            pos = paste_text.index(f"{pos} + {len(text)}c")
+        paste_text.tag_add(tk.SEL, start, pos)
+        paste_text.mark_set(tk.INSERT, pos)
+        return "break"
+
+    # Панель редактирования форматирования.
+    fmt_bar = ttk.Frame(paste_frame)
+    fmt_bar.grid(row=1, column=0, sticky=tk.W, pady=(4, 0))
+    ttk.Button(fmt_bar, text="Ж", width=3, command=lambda: _apply_attr(0)).pack(side=tk.LEFT)
+    ttk.Button(fmt_bar, text="К", width=3, command=lambda: _apply_attr(1)).pack(side=tk.LEFT, padx=(4, 0))
+    ttk.Button(fmt_bar, text="Ч", width=3, command=lambda: _apply_attr(2)).pack(side=tk.LEFT, padx=(4, 0))
+    ttk.Button(fmt_bar, text="Обычный", command=_clear_format_impl).pack(side=tk.LEFT, padx=(10, 0))
+    ttk.Label(fmt_bar, text="  Выделите текст и нажмите кнопку или Ctrl+B / Ctrl+I / Ctrl+U").pack(
+        side=tk.LEFT, padx=(12, 0)
+    )
+
+    paste_text.bind("<Control-b>", lambda _e: _apply_attr(0))
+    paste_text.bind("<Control-B>", lambda _e: _apply_attr(0))
+    paste_text.bind("<Control-i>", lambda _e: _apply_attr(1))
+    paste_text.bind("<Control-I>", lambda _e: _apply_attr(1))
+    paste_text.bind("<Control-u>", lambda _e: _apply_attr(2))
+    paste_text.bind("<Control-U>", lambda _e: _apply_attr(2))
 
     def paste_to_markup() -> str:
         """Сериализует поле вставки обратно в текст с тегами <b>/<i>/<u>,
