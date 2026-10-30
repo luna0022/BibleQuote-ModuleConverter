@@ -115,6 +115,7 @@ class Options:
     encoding: str = "auto"
     pattern: str = ""
     keep_on_error: bool = False
+    chapters: str = "auto"  # auto | roman | numbers | bold | none
 
 
 @dataclass
@@ -138,6 +139,7 @@ class Report:
     output_chapters: int = 0
     skipped_books: int = 0
     copied_assets: int = 0
+    headings: list[str] = field(default_factory=list)  # найденные метки глав
 
     def warning(self, message: str) -> None:
         self.warnings.append(message)
@@ -564,6 +566,43 @@ REFERENCE_PATTERNS = [
 CHAPTER_HEADING = re.compile(r"^\s*(?:#{1,6}\s*)?(?:глава|chapter)\s+([0-9]+|[IVXLCDM]+)\s*\.?\s*$", re.IGNORECASE)
 VERSE_PREFIX = re.compile(r"^\s*(?:\(?\b([0-9]{1,3}|[IVXLCDM]{1,8})\b\)?[\).:]?\s+)(?=\S)", re.IGNORECASE)
 POSSIBLE_BOOK_HEADING = re.compile(r"^\s*(?:#{1,6}\s*)?([A-Za-zА-Яа-яЁё0-9][^!?…]{1,100})$")
+STANDALONE_ROMAN = re.compile(r"^\s*([IVXLCDM]{1,7})\s*\.?\s*$")
+STANDALONE_NUMBER = re.compile(r"^\s*(\d{1,3})\s*\.?\s*$")
+END_PUNCTUATION = tuple(".!?:;,")
+
+ROMAN_VALUES = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
+
+
+def roman_to_int(token: str) -> Optional[int]:
+    """Преобразовать римскую цифру в число; None если запись некорректна."""
+    if not token or any(ch not in ROMAN_VALUES for ch in token):
+        return None
+    total = 0
+    prev = 0
+    for ch in reversed(token):
+        value = ROMAN_VALUES[ch]
+        if value < prev:
+            total -= value
+        else:
+            total += value
+            prev = value
+    # отбрасываем неканоничные записи вида IIII или IM
+    canonical = int_to_roman(total) if 0 < total <= 3999 else None
+    if canonical != token:
+        return None
+    return total
+
+
+def int_to_roman(value: int) -> str:
+    result = ""
+    for numeral, worth in (("M", 1000), ("CM", 900), ("D", 500), ("CD", 400),
+                           ("C", 100), ("XC", 90), ("L", 50), ("XL", 40),
+                           ("X", 10), ("IX", 9), ("V", 5), ("IV", 4), ("I", 1)):
+        while value >= worth:
+            result += numeral
+            value -= worth
+    return result
+
 
 
 def canonical_book(value: str) -> Optional[tuple[str, str]]:
@@ -637,11 +676,32 @@ def parse_reference_text(path: Path, text: str, options: Options, report: Report
     return books
 
 
-def parse_generic_text(path: Path, text: str, options: Options, report: Report) -> list[Book]:
+def parse_generic_text(
+    path: Path,
+    text: str,
+    options: Options,
+    report: Report,
+    marked_lines: Optional[set[int]] = None,
+    page_edge_lines: Optional[set[int]] = None,
+) -> list[Book]:
+    """Разбор произвольного текста в одну книгу с главами.
+
+    Главы определяются по: явным «Глава N»/«# Заголовок» (всегда), одиноким
+    римским цифрам и числам (только по порядку), жирным/крупным строкам
+    (по скорингу). Режим выбирается options.chapters.
+    marked_lines — номера строк (0-based), выделенных жирным/крупным шрифтом
+    (DOCX/PDF); page_edge_lines — первые/последние строки страниц PDF
+    (там одинокие числа — обычно номера страниц).
+    """
     book = Book(path.stem, path.stem, source_path=path)
     in_html = path.suffix.lower() in {".htm", ".html"}
+    marked_lines = marked_lines or set()
+    page_edge_lines = page_edge_lines or set()
+    mode = options.chapters
     current_chapter: list[str] = []
     current_title: list[str] = []
+    expected_number = 1  # ожидаемый номер следующей найденной главы
+    lines = text.splitlines()
 
     def flush_chapter() -> None:
         nonlocal current_chapter
@@ -663,7 +723,21 @@ def parse_generic_text(path: Path, text: str, options: Options, report: Report) 
                 book.chapters.append("\n".join(parts))
             current_chapter = []
 
-    for raw_line in text.splitlines():
+    def start_numbered_chapter(number: int, label: str, line_index: int) -> None:
+        nonlocal expected_number
+        flush_chapter()
+        expected_number = number + 1
+        current_title.append(f"Глава {number}")
+        current_chapter.append(f"<h2>Глава {number}</h2>")
+        report.headings.append(f"строка {line_index + 1}: Глава {number} ({label})")
+
+    def start_titled_chapter(title: str, line_index: int) -> None:
+        flush_chapter()
+        current_title.append(title)
+        current_chapter.append(f"<h2>{html.escape(title, quote=False)}</h2>")
+        report.headings.append(f"строка {line_index + 1}: {title} (заголовок)")
+
+    for line_index, raw_line in enumerate(lines):
         line = raw_line.rstrip()
         stripped = line.strip()
         if not stripped:
@@ -672,17 +746,47 @@ def parse_generic_text(path: Path, text: str, options: Options, report: Report) 
             continue
         heading = CHAPTER_HEADING.match(stripped)
         if heading:
-            flush_chapter()
-            number = heading.group(1)
-            current_title.append(f"Глава {number}")
-            current_chapter.append(f"<h2>Глава {html.escape(number)}</h2>")
+            token = heading.group(1)
+            value = int(token) if token.isdigit() else (roman_to_int(token.upper()) or 0)
+            start_numbered_chapter(value or expected_number, token, line_index)
             continue
         if stripped.startswith("#"):
-            flush_chapter()
-            title = normalize_spaces(stripped.lstrip("# "))
-            current_title.append(title)
-            current_chapter.append(f"<h2>{html.escape(title, quote=False)}</h2>")
+            start_titled_chapter(normalize_spaces(stripped.lstrip("# ")), line_index)
             continue
+
+        # --- эвристики скоринга (одинокие цифры, жирные строки) ---
+        if not in_html and mode != "none":
+            standalone_value: Optional[int] = None
+            label = ""
+            if mode in {"auto", "roman"}:
+                match = STANDALONE_ROMAN.match(stripped)
+                if match:
+                    value = roman_to_int(match.group(1))
+                    if value is not None and value == expected_number:
+                        standalone_value = value
+                        label = f"римская цифра {match.group(1)}"
+            if standalone_value is None and mode in {"auto", "numbers"}:
+                match = STANDALONE_NUMBER.match(stripped)
+                if match:
+                    value = int(match.group(1))
+                    # одинокое число на краю страницы — скорее номер страницы
+                    if value == expected_number and line_index not in page_edge_lines:
+                        standalone_value = value
+                        label = f"число {value}"
+            marked = line_index in marked_lines
+            if standalone_value is None and mode in {"auto", "bold"} and marked:
+                # жирная/крупная строка: короткая, без финальной пунктуации,
+                # отделена пустой строкой (или начало текста)
+                short = len(stripped) <= 60
+                clean_end = not stripped.endswith(END_PUNCTUATION)
+                surrounded = line_index == 0 or not lines[line_index - 1].strip()
+                if short and clean_end and surrounded:
+                    start_titled_chapter(normalize_spaces(stripped), line_index)
+                    continue
+            if standalone_value is not None:
+                start_numbered_chapter(standalone_value, label, line_index)
+                continue
+
         if in_html:
             current_chapter.append(line)
         else:
@@ -698,10 +802,17 @@ def parse_generic_text(path: Path, text: str, options: Options, report: Report) 
             book.chapters = [text]
         else:
             book.chapters = [escape_text_paragraphs(text)]
+    elif not book.chapters[0].lstrip().startswith("<h2>") and len(book.chapters) > 1:
+        # текст перед первой меткой (вступление, титульный лист) приклеиваем
+        # к первой главе — иначе число меток в файле окажется на одну меньше
+        # объявленного ChapterQty и последняя глава не откроется
+        book.chapters[1] = book.chapters[0] + "\n" + book.chapters[1]
+        del book.chapters[0]
     if not book.full_name:
         book.full_name = " ".join(current_title[:1]) or path.stem
     book.actual_chapter_qty = len(book.chapters)
     return [book]
+
 
 
 # Подмена кириллицы в некоторых старых PDF: текст хранится как похожие
@@ -728,6 +839,16 @@ def looks_like_pdf_spoof(text: str) -> bool:
 
 def extract_pdf_text(path: Path, report: Report) -> str:
     """Извлечь текст из PDF через pypdf (доступен в поставке Python)."""
+
+
+def extract_pdf_text(path: Path, report: Report) -> tuple[str, set[int], set[int]]:
+    """Извлечь текст из PDF через pypdf (доступен в поставке Python).
+
+    Возвращает (текст, края_страниц, крупный_шрифт):
+    - края страниц — номера первых/последних непустых строк каждой страницы
+      (там одинокие числа — обычно номера страниц, не главы);
+    - крупный шрифт — номера строк, набранных заметно крупнее основного текста
+      (кандидаты в заголовки)."""
     try:
         from pypdf import PdfReader
     except ImportError as exc:  # pragma: no cover
@@ -736,11 +857,35 @@ def extract_pdf_text(path: Path, report: Report) -> str:
         ) from exc
     reader = PdfReader(str(path))
     pages: list[str] = []
+    all_lines: list[str] = []
+    page_edge_lines: set[int] = set()
+    big_fragments: list[str] = []
     for page in reader.pages:
+        fragments: list[tuple[str, float]] = []
+
+        def visitor(text_fragment, _cm, _tm, font_dict, font_size) -> None:
+            if text_fragment and text_fragment.strip():
+                fragments.append((text_fragment, float(font_size or 0)))
+
         try:
-            pages.append(page.extract_text() or "")
+            page_text = page.extract_text(visitor_text=visitor) or ""
         except Exception as exc:
             report.warning(f"{path.name}: страница не прочитана: {exc}")
+            continue
+        pages.append(page_text)
+        page_lines = [ln for ln in page_text.splitlines() if ln.strip()]
+        if page_lines:
+            page_edge_lines.add(len(all_lines))  # первая строка страницы
+            all_lines.extend(page_lines)
+            page_edge_lines.add(len(all_lines) - 1)  # последняя строка страницы
+        else:
+            all_lines.extend(page_text.splitlines())
+        sizes = sorted(size for _frag, size in fragments)
+        if len(sizes) >= 4 and sizes[-1] > sizes[len(sizes) // 2] * 1.15:
+            median = sizes[len(sizes) // 2]
+            for frag, size in fragments:
+                if size > median * 1.15 and len(frag.strip()) >= 4:
+                    big_fragments.append(normalize_spaces(frag.strip()))
     text = "\n\n".join(pages).strip()
     if not text:
         raise ConversionError(
@@ -753,12 +898,22 @@ def extract_pdf_text(path: Path, report: Report) -> str:
             f"восстановлена русская кодировка."
         )
         text = fixed
-    return text
+        big_fragments = [frag.translate(PDF_SPOOF_MAP) for frag in big_fragments]
+    # переводим крупные фрагменты в номера строк итогового текста
+    big_lines: set[int] = set()
+    if big_fragments:
+        wanted = {normalize_spaces(frag) for frag in big_fragments}
+        for index, ln in enumerate(text.splitlines()):
+            norm = normalize_spaces(ln.strip())
+            if norm and norm in wanted:
+                big_lines.add(index)
+    return text, page_edge_lines, big_lines
 
 
-def extract_docx_text(path: Path) -> str:
+def extract_docx_text(path: Path) -> tuple[str, set[int]]:
     """Извлечь текст из DOCX через python-docx. Заголовки оформляются как '# ...',
-    чтобы конвертер разбил документ на главы."""
+    чтобы конвертер разбил документ на главы. Возвращает (текст, жирные строки) —
+    номера строк, полностью набранных жирным (кандидаты в заголовки)."""
     try:
         import docx
     except ImportError as exc:  # pragma: no cover
@@ -767,11 +922,15 @@ def extract_docx_text(path: Path) -> str:
         ) from exc
     document = docx.Document(str(path))
     lines: list[str] = []
+    bold_lines: set[int] = set()
     for paragraph in document.paragraphs:
         text = normalize_spaces(strip_html_markup(paragraph.text))
         if not text:
             lines.append("")
             continue
+        runs = [run for run in paragraph.runs if run.text.strip()]
+        if runs and all(run.bold for run in runs):
+            bold_lines.add(len(lines))
         style_name = (paragraph.style.name or "").lower() if paragraph.style else ""
         if style_name.startswith("heading") or style_name.startswith("заголовок"):
             level_match = re.search(r"(\d+)", style_name)
@@ -779,18 +938,18 @@ def extract_docx_text(path: Path) -> str:
             lines.append("#" * min(level, 6) + " " + text)
         else:
             lines.append(text)
-    return "\n".join(lines)
+    return "\n".join(lines), bold_lines
 
 
 def parse_plain_file(path: Path, options: Options, report: Report) -> list[Book]:
     report.input_files += 1
     ext = path.suffix.lower()
     if options.source_format == "pdf" or (options.source_format == "auto" and ext == ".pdf"):
-        text = extract_pdf_text(path, report)
-        return parse_generic_text(path, text, options, report)
+        text, page_edges, big_lines = extract_pdf_text(path, report)
+        return parse_generic_text(path, text, options, report, marked_lines=big_lines, page_edge_lines=page_edges)
     if options.source_format == "docx" or (options.source_format == "auto" and ext == ".docx"):
-        text = extract_docx_text(path)
-        return parse_generic_text(path, text, options, report)
+        text, bold_lines = extract_docx_text(path)
+        return parse_generic_text(path, text, options, report, marked_lines=bold_lines)
     text, detected = read_text_file(path, options.encoding)
     if options.source_format == "usfm" or (options.source_format == "auto" and ext in {".usfm", ".sfm"}):
         return parse_usfm_file(path, options.encoding, report)
@@ -1051,8 +1210,12 @@ def write_report(options: Options, report: Report) -> None:
         f"Пропущено недоступных книг: {report.skipped_books}",
         f"Скопировано дополнительных файлов: {report.copied_assets}",
         "",
-        "Предупреждения:",
     ]
+    if report.headings:
+        lines.append(f"Метки глав ({len(report.headings)}):")
+        lines.extend(f"- {item}" for item in report.headings)
+        lines.append("")
+    lines.append("Предупреждения:")
     lines.extend(f"- {item}" for item in report.warnings)
     if report.errors:
         lines.append("")
@@ -1186,6 +1349,13 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--keep-on-error", action="store_true", help="Не удалять каталог результата при ошибке")
     parser.add_argument(
+        "--chapters",
+        choices=["auto", "roman", "numbers", "bold", "none"],
+        default="auto",
+        help="Как определять главы в текстовых источниках: авто (все сигналы), "
+        "только римские цифры, только числа, только жирные строки, не разбивать",
+    )
+    parser.add_argument(
         "--sanitize",
         action="store_true",
         help="Режим починки: обработать --input как каталог библиотеки BibleQuote "
@@ -1198,6 +1368,10 @@ def print_report(report: Report) -> None:
     print(f"Прочитано файлов: {report.input_files}")
     print(f"Записано книг: {report.output_books}")
     print(f"Записано глав: {report.output_chapters}")
+    if report.headings:
+        shown = ", ".join(report.headings[:12])
+        more = f" … (+{len(report.headings) - 12})" if len(report.headings) > 12 else ""
+        print(f"Метки глав ({len(report.headings)}): {shown}{more}")
     if report.warnings:
         print("\nПредупреждения:")
         for warning in report.warnings:
@@ -1231,6 +1405,7 @@ def run_cli(argv: Optional[list[str]] = None) -> int:
         encoding=args.encoding,
         pattern=args.pattern,
         keep_on_error=args.keep_on_error,
+        chapters=args.chapters,
     )
     try:
         report = convert(options)
@@ -1259,6 +1434,7 @@ def run_gui() -> int:
     kind_var = tk.StringVar(value="auto")
     encoding_var = tk.StringVar(value="auto")
     pattern_var = tk.StringVar()
+    chapters_var = tk.StringVar(value="auto")
 
     main = ttk.Frame(root, padding=12)
     main.pack(fill=tk.BOTH, expand=True)
@@ -1345,6 +1521,7 @@ def run_gui() -> int:
             module_kind=kind_var.get(),
             encoding=encoding_var.get(),
             pattern=pattern_var.get(),
+            chapters=chapters_var.get(),
         )
         convert_button.state(["disabled"])
         root.update_idletasks()
@@ -1362,6 +1539,10 @@ def run_gui() -> int:
             log.insert(tk.END, f"Результат: {options.output_path}\n")
             log.insert(tk.END, f"Книг: {report.output_books}\n")
             log.insert(tk.END, f"Глав: {report.output_chapters}\n")
+            if report.headings:
+                shown = "; ".join(report.headings[:10])
+                more = f" … (+{len(report.headings) - 10})" if len(report.headings) > 10 else ""
+                log.insert(tk.END, f"Метки глав ({len(report.headings)}): {shown}{more}\n")
             if report.warnings:
                 log.insert(tk.END, "\nПредупреждения:\n")
                 for warning in report.warnings:
@@ -1403,6 +1584,15 @@ def run_gui() -> int:
         width=18,
     )
     kind_box.grid(row=5, column=1, sticky=tk.W, pady=3)
+    chapters_box = ttk.Combobox(
+        main,
+        textvariable=chapters_var,
+        values=["auto", "roman", "numbers", "bold", "none"],
+        state="readonly",
+        width=10,
+    )
+    chapters_box.grid(row=5, column=2, sticky=tk.W, pady=3)
+    ttk.Label(main, text="Главы (auto — все сигналы)").grid(row=5, column=2, sticky=tk.W, padx=(120, 0), pady=3)
 
     ttk.Label(main, text="Кодировка:").grid(row=6, column=0, sticky=tk.W, pady=3)
     encoding_box = ttk.Combobox(
