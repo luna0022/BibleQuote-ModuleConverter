@@ -36,7 +36,7 @@ ENCODINGS = {
     "iso-8859-1": "iso-8859-1",
 }
 
-TEXT_EXTENSIONS = {".txt", ".md", ".markdown", ".text", ".htm", ".html", ".usfm", ".sfm"}
+TEXT_EXTENSIONS = {".txt", ".md", ".markdown", ".text", ".htm", ".html", ".usfm", ".sfm", ".pdf", ".docx"}
 BOOK_FIELDS = {"pathname", "fullname", "shortname", "chapterqty"}
 
 CANONICAL_BOOKS = [
@@ -649,7 +649,18 @@ def parse_generic_text(path: Path, text: str, options: Options, report: Report) 
             if in_html:
                 book.chapters.append("\n".join(current_chapter))
             else:
-                book.chapters.append(escape_text_paragraphs("\n".join(current_chapter)))
+                # Строки-разметка (<h2>..., <p><b>...), вставленные самим парсером,
+                # не экранируем: иначе BibleQuote не найдёт метки ChapterSign/VerseSign
+                # в теле книги и глава не откроется.
+                parts = []
+                for item in current_chapter:
+                    if item.lstrip().startswith("<"):
+                        parts.append(item)
+                    elif item.strip():
+                        parts.append(
+                            f"<p>{html.escape(normalize_spaces(strip_html_markup(item)), quote=False)}</p>"
+                        )
+                book.chapters.append("\n".join(parts))
             current_chapter = []
 
     for raw_line in text.splitlines():
@@ -693,10 +704,65 @@ def parse_generic_text(path: Path, text: str, options: Options, report: Report) 
     return [book]
 
 
+def extract_pdf_text(path: Path, report: Report) -> str:
+    """Извлечь текст из PDF через pypdf (доступен в поставке Python)."""
+    try:
+        from pypdf import PdfReader
+    except ImportError as exc:  # pragma: no cover
+        raise ConversionError(
+            "Для чтения PDF нужен пакет pypdf. Установите: pip install pypdf"
+        ) from exc
+    reader = PdfReader(str(path))
+    pages: list[str] = []
+    for page in reader.pages:
+        try:
+            pages.append(page.extract_text() or "")
+        except Exception as exc:
+            report.warning(f"{path.name}: страница не прочитана: {exc}")
+    text = "\n\n".join(pages).strip()
+    if not text:
+        raise ConversionError(
+            f"{path.name}: в PDF не извлечён текст — возможно, это скан без текстового слоя."
+        )
+    return text
+
+
+def extract_docx_text(path: Path) -> str:
+    """Извлечь текст из DOCX через python-docx. Заголовки оформляются как '# ...',
+    чтобы конвертер разбил документ на главы."""
+    try:
+        import docx
+    except ImportError as exc:  # pragma: no cover
+        raise ConversionError(
+            "Для чтения DOCX нужен пакет python-docx. Установите: pip install python-docx"
+        ) from exc
+    document = docx.Document(str(path))
+    lines: list[str] = []
+    for paragraph in document.paragraphs:
+        text = normalize_spaces(strip_html_markup(paragraph.text))
+        if not text:
+            lines.append("")
+            continue
+        style_name = (paragraph.style.name or "").lower() if paragraph.style else ""
+        if style_name.startswith("heading") or style_name.startswith("заголовок"):
+            level_match = re.search(r"(\d+)", style_name)
+            level = int(level_match.group(1)) if level_match else 1
+            lines.append("#" * min(level, 6) + " " + text)
+        else:
+            lines.append(text)
+    return "\n".join(lines)
+
+
 def parse_plain_file(path: Path, options: Options, report: Report) -> list[Book]:
-    text, detected = read_text_file(path, options.encoding)
     report.input_files += 1
     ext = path.suffix.lower()
+    if options.source_format == "pdf" or (options.source_format == "auto" and ext == ".pdf"):
+        text = extract_pdf_text(path, report)
+        return parse_generic_text(path, text, options, report)
+    if options.source_format == "docx" or (options.source_format == "auto" and ext == ".docx"):
+        text = extract_docx_text(path)
+        return parse_generic_text(path, text, options, report)
+    text, detected = read_text_file(path, options.encoding)
     if options.source_format == "usfm" or (options.source_format == "auto" and ext in {".usfm", ".sfm"}):
         return parse_usfm_file(path, options.encoding, report)
     if options.source_format == "text":
@@ -1050,9 +1116,9 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--short", default="", help="Короткое имя итогового модуля")
     parser.add_argument(
         "--format",
-        choices=["auto", "native", "text", "usfm"],
+        choices=["auto", "native", "text", "usfm", "pdf", "docx"],
         default="auto",
-        help="Формат источника",
+        help="Формат источника (auto распознаёт PDF и DOCX по расширению файла)",
     )
     parser.add_argument(
         "--kind",
@@ -1135,8 +1201,8 @@ def run_gui() -> int:
 
     root = tk.Tk()
     root.title("Конвертер модулей BibleQuote")
-    root.geometry("860x640")
-    root.minsize(720, 540)
+    root.geometry("860x780")
+    root.minsize(720, 640)
 
     input_var = tk.StringVar()
     output_var = tk.StringVar()
@@ -1150,13 +1216,15 @@ def run_gui() -> int:
     main = ttk.Frame(root, padding=12)
     main.pack(fill=tk.BOTH, expand=True)
     main.columnconfigure(1, weight=1)
-    main.rowconfigure(8, weight=1)
+    main.rowconfigure(9, weight=1)
 
     def choose_input() -> None:
         filename = filedialog.askopenfilename(
-            title="Выберите текстовую книгу",
+            title="Выберите книгу",
             filetypes=[
-                ("Книги", "*.txt *.md *.markdown *.htm *.html *.usfm *.sfm"),
+                ("Книги и документы", "*.txt *.md *.markdown *.htm *.html *.usfm *.sfm *.pdf *.docx"),
+                ("PDF", "*.pdf"),
+                ("Word", "*.docx"),
                 ("Все файлы", "*.*"),
             ],
         )
@@ -1190,20 +1258,43 @@ def run_gui() -> int:
             r"^\s*(?P<book>.+?)\s+(?P<chapter>\d+):(?P<verse>\d+)\s*(?P<text>.*)$",
         )
 
+    paste_holder: list[Path] = []
+
     def do_convert() -> None:
         log.delete("1.0", tk.END)
-        if not input_var.get():
-            messagebox.showwarning("Конвертер", "Сначала выберите файл или каталог источника.")
+        pasted = paste_text.get("1.0", tk.END).strip()
+        temp_input: Optional[Path] = None
+        if pasted and not input_var.get().strip():
+            # Вставленный текст складываем во временный файл и конвертируем как text.
+            import tempfile
+
+            handle = tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", suffix=".txt", prefix="bq_pasted_", delete=False
+            )
+            with handle:
+                handle.write(pasted)
+            temp_input = Path(handle.name)
+            paste_holder.append(temp_input)
+            source = temp_input
+            source_format = "text"
+        elif input_var.get().strip():
+            source = Path(input_var.get())
+            source_format = format_var.get()
+        else:
+            messagebox.showwarning(
+                "Конвертер",
+                "Укажите источник: выберите файл/папку или вставьте текст в поле ниже.",
+            )
             return
         if not output_var.get():
             messagebox.showwarning("Конвертер", "Укажите новый пустой каталог результата.")
             return
         options = Options(
-            input_path=Path(input_var.get()),
+            input_path=source,
             output_path=Path(output_var.get()),
             module_name=name_var.get(),
             short_name=short_var.get(),
-            source_format=format_var.get(),
+            source_format=source_format,
             module_kind=kind_var.get(),
             encoding=encoding_var.get(),
             pattern=pattern_var.get(),
@@ -1217,7 +1308,10 @@ def run_gui() -> int:
             messagebox.showerror("Конвертер", str(exc))
         else:
             log.insert(tk.END, "Преобразование завершено.\n\n")
-            log.insert(tk.END, f"Источник: {options.input_path}\n")
+            if temp_input is not None:
+                log.insert(tk.END, "Источник: вставленный текст\n")
+            else:
+                log.insert(tk.END, f"Источник: {options.input_path}\n")
             log.insert(tk.END, f"Результат: {options.output_path}\n")
             log.insert(tk.END, f"Книг: {report.output_books}\n")
             log.insert(tk.END, f"Глав: {report.output_chapters}\n")
@@ -1247,7 +1341,7 @@ def run_gui() -> int:
     format_box = ttk.Combobox(
         main,
         textvariable=format_var,
-        values=["auto", "native", "text", "usfm"],
+        values=["auto", "native", "text", "usfm", "pdf", "docx"],
         state="readonly",
         width=18,
     )
@@ -1277,11 +1371,17 @@ def run_gui() -> int:
     ttk.Entry(main, textvariable=pattern_var).grid(row=7, column=1, sticky=tk.EW, pady=3)
     ttk.Button(main, text="?", width=3, command=show_pattern_help).grid(row=7, column=2, padx=(8, 0), pady=3)
 
-    log = scrolledtext.ScrolledText(main, height=14, wrap=tk.WORD)
-    log.grid(row=8, column=0, columnspan=3, sticky=tk.NSEW, pady=(12, 8))
+    paste_frame = ttk.Labelframe(main, text=" Или вставьте текст сюда (работает, если поле «Источник» пустое) ")
+    paste_frame.grid(row=8, column=0, columnspan=3, sticky=tk.EW, pady=(8, 4))
+    paste_frame.columnconfigure(0, weight=1)
+    paste_text = scrolledtext.ScrolledText(paste_frame, height=7, wrap=tk.WORD)
+    paste_text.grid(row=0, column=0, sticky=tk.EW)
+
+    log = scrolledtext.ScrolledText(main, height=12, wrap=tk.WORD)
+    log.grid(row=9, column=0, columnspan=3, sticky=tk.NSEW, pady=(12, 8))
 
     buttons = ttk.Frame(main)
-    buttons.grid(row=9, column=0, columnspan=3, sticky=tk.E)
+    buttons.grid(row=10, column=0, columnspan=3, sticky=tk.E)
 
     def do_sanitize() -> None:
         target = Path(input_var.get().strip()) if input_var.get().strip() else filedialog.askdirectory(title="Каталог библиотеки BibleQuote")
@@ -1311,11 +1411,12 @@ def run_gui() -> int:
     ttk.Label(
         main,
         text=(
-            "Поддерживаются нативные модули BibleQuote (каталог с bibleqt.ini), TXT/MD/HTML и USFM. "
+            "Поддерживаются нативные модули BibleQuote (каталог с bibleqt.ini), TXT/MD/HTML, USFM, "
+            "PDF (текстовый слой) и DOCX (заголовки Word становятся главами). "
             "Исходные файлы не изменяются; результат должен быть новым пустым каталогом."
         ),
         wraplength=810,
-    ).grid(row=10, column=0, columnspan=3, sticky=tk.W, pady=(8, 0))
+    ).grid(row=11, column=0, columnspan=3, sticky=tk.W, pady=(8, 0))
 
     root.mainloop()
     return 0
